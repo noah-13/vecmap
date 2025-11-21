@@ -22,7 +22,7 @@ import numpy as np
 import re
 import sys
 import time
-
+import os
 
 def dropout(m, p):
     if p <= 0.0:
@@ -52,6 +52,8 @@ def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
 
 
 def main():
+    total_start_time = time.time()  #starting time for the entire script
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Map word embeddings in two languages into a shared space')
     parser.add_argument('src_input', help='the input source embeddings')
@@ -261,8 +263,17 @@ def main():
     trg_indices_backward = xp.arange(trg_size)
     knn_sim_fwd = xp.zeros(src_size, dtype=dtype)
     knn_sim_bwd = xp.zeros(trg_size, dtype=dtype)
-
+    
     # Training loop
+    blacklist = {'resilience', 'resilient', 'resiliency', 'resil', 'resiliencia', 
+                 'resilsim', 'resilienza', 'resiliencebuilding', 'resili', 'resilienz', 
+                 'resiliencebased', 'resilio', 'resiliences', 'resiliente', 'resiliencies', 
+                 'resilientes', 'resilien', 'resilienceai', 'resilire', 'resiliently', 'resilus', 
+                 'resilienceand', 'resilience1', 'resilence', 'resilis', 'resiliencerelated', 
+                 'resilience2', 'resilincia', 'resiliance', 'resilience3', 'resiliencepdf', 
+                 'resiliencecid1', 'resilienceenhancing', 'resiliencevulnerability', 'resilience26', 
+                 'resilienceto', 'resiliencethe', 'resileince', 'resilience5', 'resilientprotection', 
+                 'resilience4', 'resilienceoriented', 'resiliere', 'resilience6'}
     best_objective = objective = -100.
     it = 1
     last_improvement = 0
@@ -329,7 +340,6 @@ def main():
             if args.dim_reduction > 0:
                 xw = xw[:, :args.dim_reduction]
                 zw = zw[:, :args.dim_reduction]
-
         # Self-learning
         if end:
             break
@@ -368,6 +378,15 @@ def main():
             elif args.direction == 'union':
                 src_indices = xp.concatenate((src_indices_forward, src_indices_backward))
                 trg_indices = xp.concatenate((trg_indices_forward, trg_indices_backward))
+                
+            # === Blacklist filtering: prevent certain words from being actively aligned ===
+            mask = [
+                (src_words[int(src_indices[i])] not in blacklist) and
+                (trg_words[int(trg_indices[i])] not in blacklist)
+                for i in range(len(src_indices))
+            ]
+            src_indices = src_indices[mask]
+            trg_indices = trg_indices[mask]
 
             # Objective function evaluation
             if args.direction == 'forward':
@@ -379,7 +398,7 @@ def main():
             if objective - best_objective >= args.threshold:
                 last_improvement = it
                 best_objective = objective
-
+                
             # Accuracy and similarity evaluation in validation
             if args.validation is not None:
                 src = list(validation.keys())
@@ -406,6 +425,24 @@ def main():
                 print('{0}\t{1:.6f}\t{2}\t{3:.6f}'.format(it, 100 * objective, val, duration), file=log)
                 log.flush()
 
+            # Decide subfolder based on training mode
+            if args.semi_supervised is not None:
+                dict_dir = "data/dict/semi"
+            elif args.unsupervised or args.acl2018:  # unsupervised 和 ACL2018 属于无监督初始化
+                dict_dir = "data/dict/unsup"
+            else:
+                dict_dir = "data/dict/others"
+
+            # Ensure directory exists
+            os.makedirs(dict_dir, exist_ok=True)
+
+            # Save dictionary word pairs of current iteration
+            dict_filename = os.path.join(dict_dir, f"dictionary_iter_{it}.txt")
+            with open(dict_filename, "w", encoding="utf-8") as f:
+                for i in range(len(src_indices)):
+                    src_word = src_words[int(src_indices[i])]
+                    trg_word = trg_words[int(trg_indices[i])]
+                    f.write(f"{src_word}\t{trg_word}\n")
         t = time.time()
         it += 1
 
@@ -417,6 +454,8 @@ def main():
     srcfile.close()
     trgfile.close()
 
-
+    total_end_time = time.time()
+    total_duration = total_end_time - total_start_time
+    print(f"\nTotal execution time: {total_duration:.2f} seconds")
 if __name__ == '__main__':
     main()

@@ -1,17 +1,7 @@
 # Copyright (C) 2016-2018  Mikel Artetxe <artetxem@gmail.com>
 #
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+# GPL v3 license
 #
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import embeddings
 from cupy_utils import *
@@ -20,12 +10,15 @@ import argparse
 import collections
 import numpy as np
 import sys
+import os
+import glob
+import csv
 
 
 BATCH_SIZE = 500
 
 
-def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
+def topk_mean(m, k, inplace=False):  # Assuming that axis is 1
     xp = get_array_module(m)
     n = m.shape[0]
     ans = xp.zeros(n, dtype=m.dtype)
@@ -43,24 +36,8 @@ def topk_mean(m, k, inplace=False):  # TODO Assuming that axis is 1
     return ans / k
 
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Evaluate embeddings of two languages in a shared space in word translation induction')
-    parser.add_argument('src_embeddings', help='the source language embeddings')
-    parser.add_argument('trg_embeddings', help='the target language embeddings')
-    parser.add_argument('-d', '--dictionary', default=sys.stdin.fileno(), help='the test dictionary file (defaults to stdin)')
-    parser.add_argument('--retrieval', default='nn', choices=['nn', 'invnn', 'invsoftmax', 'csls'], help='the retrieval method (nn: standard nearest neighbor; invnn: inverted nearest neighbor; invsoftmax: inverted softmax; csls: cross-domain similarity local scaling)')
-    parser.add_argument('--inv_temperature', default=1, type=float, help='the inverse temperature (only compatible with inverted softmax)')
-    parser.add_argument('--inv_sample', default=None, type=int, help='use a random subset of the source vocabulary for the inverse computations (only compatible with inverted softmax)')
-    parser.add_argument('-k', '--neighborhood', default=10, type=int, help='the neighborhood size (only compatible with csls)')
-    parser.add_argument('--dot', action='store_true', help='use the dot product in the similarity computations instead of the cosine')
-    parser.add_argument('--encoding', default='utf-8', help='the character encoding for input/output (defaults to utf-8)')
-    parser.add_argument('--seed', type=int, default=0, help='the random seed')
-    parser.add_argument('--precision', choices=['fp16', 'fp32', 'fp64'], default='fp32', help='the floating-point precision (defaults to fp32)')
-    parser.add_argument('--cuda', action='store_true', help='use cuda (requires cupy)')
-    args = parser.parse_args()
-
-    # Choose the right dtype for the desired precision
+def run_eval(src_embeddings, trg_embeddings, args):
+    # Choose dtype
     if args.precision == 'fp16':
         dtype = 'float16'
     elif args.precision == 'fp32':
@@ -68,13 +45,13 @@ def main():
     elif args.precision == 'fp64':
         dtype = 'float64'
 
-    # Read input embeddings
-    srcfile = open(args.src_embeddings, encoding=args.encoding, errors='surrogateescape')
-    trgfile = open(args.trg_embeddings, encoding=args.encoding, errors='surrogateescape')
+    # Read embeddings
+    srcfile = open(src_embeddings, encoding=args.encoding, errors='surrogateescape')
+    trgfile = open(trg_embeddings, encoding=args.encoding, errors='surrogateescape')
     src_words, x = embeddings.read(srcfile, dtype=dtype)
     trg_words, z = embeddings.read(trgfile, dtype=dtype)
 
-    # NumPy/CuPy management
+    # NumPy/CuPy
     if args.cuda:
         if not supports_cupy():
             print('ERROR: Install CuPy for CUDA support', file=sys.stderr)
@@ -86,12 +63,12 @@ def main():
         xp = np
     xp.random.seed(args.seed)
 
-    # Length normalize embeddings so their dot product effectively computes the cosine similarity
+    # Normalize embeddings (for cosine)
     if not args.dot:
         embeddings.length_normalize(x)
         embeddings.length_normalize(z)
 
-    # Build word to index map
+    # Build word->index maps
     src_word2ind = {word: i for i, word in enumerate(src_words)}
     trg_word2ind = {word: i for i, word in enumerate(trg_words)}
 
@@ -110,62 +87,128 @@ def main():
         except KeyError:
             oov.add(src)
     src = list(src2trg.keys())
-    oov -= vocab  # If one of the translation options is in the vocabulary, then the entry is not an oov
-    coverage = len(src2trg) / (len(src2trg) + len(oov))
+    oov -= vocab
+    coverage = len(src2trg) / (len(src2trg) + len(oov)) if (len(src2trg) + len(oov)) > 0 else 0.0
 
-    # Find translations
-    translation = collections.defaultdict(int)
-    if args.retrieval == 'nn':  # Standard nearest neighbor
+    # Translation candidates
+    max_k = max(args.topk_list)
+    translation = {}
+    if args.retrieval == 'nn':
         for i in range(0, len(src), BATCH_SIZE):
             j = min(i + BATCH_SIZE, len(src))
             similarities = x[src[i:j]].dot(z.T)
-            nn = similarities.argmax(axis=1).tolist()
-            for k in range(j-i):
-                translation[src[i+k]] = nn[k]
-    elif args.retrieval == 'invnn':  # Inverted nearest neighbor
-        best_rank = np.full(len(src), x.shape[0], dtype=int)
-        best_sim = np.full(len(src), -100, dtype=dtype)
-        for i in range(0, z.shape[0], BATCH_SIZE):
-            j = min(i + BATCH_SIZE, z.shape[0])
-            similarities = z[i:j].dot(x.T)
-            ind = (-similarities).argsort(axis=1)
-            ranks = asnumpy(ind.argsort(axis=1)[:, src])
-            sims = asnumpy(similarities[:, src])
-            for k in range(i, j):
-                for l in range(len(src)):
-                    rank = ranks[k-i, l]
-                    sim = sims[k-i, l]
-                    if rank < best_rank[l] or (rank == best_rank[l] and sim > best_sim[l]):
-                        best_rank[l] = rank
-                        best_sim[l] = sim
-                        translation[src[l]] = k
-    elif args.retrieval == 'invsoftmax':  # Inverted softmax
-        sample = xp.arange(x.shape[0]) if args.inv_sample is None else xp.random.randint(0, x.shape[0], args.inv_sample)
-        partition = xp.zeros(z.shape[0])
-        for i in range(0, len(sample), BATCH_SIZE):
-            j = min(i + BATCH_SIZE, len(sample))
-            partition += xp.exp(args.inv_temperature*z.dot(x[sample[i:j]].T)).sum(axis=1)
-        for i in range(0, len(src), BATCH_SIZE):
-            j = min(i + BATCH_SIZE, len(src))
-            p = xp.exp(args.inv_temperature*x[src[i:j]].dot(z.T)) / partition
-            nn = p.argmax(axis=1).tolist()
-            for k in range(j-i):
-                translation[src[i+k]] = nn[k]
-    elif args.retrieval == 'csls':  # Cross-domain similarity local scaling
+            topk = (-similarities).argsort(axis=1)[:, :max_k]
+            for k in range(j - i):
+                translation[src[i + k]] = topk[k].tolist()
+
+    elif args.retrieval == 'csls':
         knn_sim_bwd = xp.zeros(z.shape[0])
         for i in range(0, z.shape[0], BATCH_SIZE):
             j = min(i + BATCH_SIZE, z.shape[0])
             knn_sim_bwd[i:j] = topk_mean(z[i:j].dot(x.T), k=args.neighborhood, inplace=True)
         for i in range(0, len(src), BATCH_SIZE):
             j = min(i + BATCH_SIZE, len(src))
-            similarities = 2*x[src[i:j]].dot(z.T) - knn_sim_bwd  # Equivalent to the real CSLS scores for NN
-            nn = similarities.argmax(axis=1).tolist()
-            for k in range(j-i):
-                translation[src[i+k]] = nn[k]
+            similarities = 2 * x[src[i:j]].dot(z.T) - knn_sim_bwd
+            topk = (-similarities).argsort(axis=1)[:, :max_k]
+            for k in range(j - i):
+                translation[src[i + k]] = topk[k].tolist()
 
-    # Compute accuracy
-    accuracy = np.mean([1 if translation[i] in src2trg[i] else 0 for i in src])
-    print('Coverage:{0:7.2%}  Accuracy:{1:7.2%}'.format(coverage, accuracy))
+    # Compute accuracy for each k
+    acc_dict = {}
+    for k in args.topk_list:
+        correct = 0
+        for i in src:
+            predicted = translation[i][:k]
+            gold = src2trg[i]
+            if any(t in gold for t in predicted):
+                correct += 1
+        accuracy = correct / len(src) if len(src) > 0 else 0.0
+        acc_dict[k] = accuracy
+
+    # ---- Compute average cosine similarity for dictionary pairs ----
+    cos_sims = []
+    for src_ind, trg_inds in src2trg.items():
+        for trg_ind in trg_inds:
+            sim = float(x[src_ind].dot(z[trg_ind]))
+            cos_sims.append(sim)
+    avg_cos = float(np.mean(cos_sims)) if cos_sims else 0.0
+
+    return coverage, acc_dict, avg_cos
+
+
+def auto_eval(folder, args):
+    results = []
+
+    # 遍历 folder 下所有子文件夹
+    for subdir, dirs, files in os.walk(folder):
+        # 只识别 .vec 文件
+        vec_files = [os.path.join(subdir, f) for f in files if f.endswith(".vec")]
+
+        # 如果没有 vec 文件，跳过
+        if len(vec_files) == 0:
+            continue
+
+        # 如果不等于 2，认为错误
+        if len(vec_files) != 2:
+            print(f"[WARN] 子文件夹中 .vec 文件不是 2 个: {subdir} (找到 {len(vec_files)} 个)")
+            continue
+
+        # 取两个 vec 文件
+        file1, file2 = sorted(vec_files)
+
+        print(f"\n=== Evaluating in folder: {subdir} ===")
+        print(f"  File 1: {file1}")
+        print(f"  File 2: {file2}")
+
+        coverage, acc_dict, avg_cos = run_eval(file1, file2, args)
+
+        row = {
+            "folder": subdir,
+            "file1": file1,
+            "file2": file2,
+            "coverage": coverage,
+            "avg_cos": avg_cos,
+        }
+        for k, acc in acc_dict.items():
+            row[f"top{k}_acc"] = acc
+
+        results.append(row)
+
+    # 输出结果
+    dict_base = os.path.splitext(os.path.basename(args.dictionary))[0]
+    out_csv = os.path.join(folder, f"evaluation_results_{dict_base}.csv")
+
+    fieldnames = ["folder", "file1", "file2", "coverage"] + \
+                 [f"top{k}_acc" for k in args.topk_list] + ["avg_cos"]
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+
+    print(f"\n[INFO] 结果已保存到 {out_csv}")
+
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate embeddings in a folder (USA* vs China*)')
+    parser.add_argument('folder', help='folder containing embeddings')
+    parser.add_argument('-d', '--dictionary', required=True, help='the test dictionary file')
+    parser.add_argument('--retrieval', default='csls', choices=['nn', 'invnn', 'invsoftmax', 'csls'], help='retrieval method')
+    parser.add_argument('--inv_temperature', default=1, type=float, help='inverse temperature (for invsoftmax)')
+    parser.add_argument('--inv_sample', default=None, type=int, help='random subset size for inverse computations (invsoftmax)')
+    parser.add_argument('-k', '--neighborhood', default=10, type=int, help='neighborhood size (for csls)')
+    parser.add_argument('--dot', action='store_true', help='use dot product instead of cosine')
+    parser.add_argument('--encoding', default='utf-8', help='character encoding for input/output')
+    parser.add_argument('--seed', type=int, default=0, help='random seed')
+    parser.add_argument('--precision', choices=['fp16', 'fp32', 'fp64'], default='fp32', help='floating-point precision')
+    parser.add_argument('--topk_list', type=int, nargs='+', default=[1, 5, 10], help='compute Top-k accuracy for given k values (default=[1,5,10])')
+    parser.add_argument('--cuda', action='store_true', help='use cuda (requires cupy)')
+    args = parser.parse_args()
+
+    auto_eval(args.folder, args)
 
 
 if __name__ == '__main__':

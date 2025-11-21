@@ -8,3 +8,23 @@ __pycache__/
 *.py[cod]
 *$py.class
 .idea/
+
+# ======================
+#  Embedding / Model Files
+# ======================
+*.vec
+*.bin
+*.ftz
+*.model
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# fastText outputs
+*/fasttext/*
+models/
+aligned_models/
+aligned_embs/
